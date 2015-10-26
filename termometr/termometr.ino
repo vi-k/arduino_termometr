@@ -379,10 +379,10 @@ void setup()
      * Настраиваем экраны
      */
     
-    g_screens[SENSOR1_MIN].set_brightness(4);
-    g_screens[SENSOR2_MIN].set_brightness(4);
-    g_screens[SENSOR1_MAX].set_brightness(4);
-    g_screens[SENSOR2_MAX].set_brightness(4);
+    g_screens[SENSOR1_MIN].set_brightness(7);
+    g_screens[SENSOR2_MIN].set_brightness(7);
+    g_screens[SENSOR1_MAX].set_brightness(7);
+    g_screens[SENSOR2_MAX].set_brightness(7);
     g_active_screen = SENSOR1;
     
     /***
