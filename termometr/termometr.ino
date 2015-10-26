@@ -2,496 +2,575 @@
  * Термометр, вариант из общего шаблона:
  *  - индикатор подключен напрямую к Atmega328p;
  *  - два датчика - внутренний и внешний DS18B20;
- *  - две кнопки (вместо 4-х).
+ *  - четыре кнопки.
  *
  *  (c) Дунаев В.В., 2015
  *
  *  B0-B7 - аноды индикатора в последовательности B-G-C-Dp-D-E-A-F (для PORTB: F-A-E-D-Dp-C-G-B)
  *  C2-C5 - катоды индикаторы в последовательности D4-D3-D2-D1 (для PORTC: x-x-D1-D2-D3-D4-x-x)
  *  D0-D3 - кнопки в последовательности [1]-[2]-[3]-[4] (для PORTD: x-x-x-x-[4]-[3]-[2]-[1])
- *    (в данном варианте задействованы только кнопки [3] и [4], настройки не меняются, чтобы не перекраивать
- *    весь проект)
  *  D7 - температурные датчики DS18B20 (для PORTD: DS-x-x-x-x-x-x-x)
  */
 
+/* Записи в EEPROM */
+#define EEPROM_SWAP_SENSORS 0
+
 #include <OneWire.h>
 #include <LowPower.h>
+#include "indicator.h"
 
-OneWire ds18b20(7); /* Порт D7 на Arduino = D7 на Atmega328p */
-uint8_t ds_address[2][8]; /* Адреса датчиков */
-bool g_data_is_obsolete = true; /* Флаг устаревания данных для обновления */
-unsigned long g_work_timestamp; /* Время активности (время с последнего нажатия кнопки) */
-bool g_sensors_swap = false; /* При подключении датчиков невозможно задать порядок подключения. Он
-  определяется внутренними адресами датчиков. По этой причине для единообразия делаем возможной перемену
-  датчиков местами */
+indicator_t g_indicator;
 
-/***************************************
- * Индикация
- */
-uint8_t g_indicator[4]; /* Значения на индикаторе */
-uint8_t g_indicator_i = 0; /* Счётчик для динамической индикации */
+/* Экраны */
+#define SENSOR1     0
+#define SENSOR2     1
+#define SENSORS_MIN 2
+#define SENSOR1_MIN 2
+#define SENSOR2_MIN 3
+#define SENSORS_MAX 4
+#define SENSOR1_MAX 4
+#define SENSOR2_MAX 5
+#define MESSAGE 254
+#define NOTHING 255
 
-/* "Изображения" цифр для индикатора */
-const uint8_t c_digits[] = {
-  /* F-A-E-D-Dp-C-G-B
-   *    A
-   *  F   B
-   *    G
-   *  E   C
-   *    D   Dp
-   */
-  0b11110101, /* 0 */
-  0b00000101, /* 1 */
-  0b01110011, /* 2 */
-  0b01010111, /* 3 */
-  0b10000111, /* 4 */
-  0b11010110, /* 5 */
-  0b11110110, /* 6 */
-  0b01000101, /* 7 */
-  0b11110111, /* 8 */
-  0b11010111, /* 9 */
-  0b00000010, /* 10 - */
-  0b00001000, /* 11 . */
-  0b11100111, /* 12 A */
-  0b10110110, /* 13 b */
-  0b11110000, /* 14 C */
-  0b00110010, /* 15 c */
-  0b00110111, /* 16 d */
-  0b11110010, /* 17 E */
-  0b11100010, /* 18 F */
-  0b11110100, /* 19 G */
-  0b10100110, /* 20 h */
-  0b10100000, /* 21 I(слева) */
-  0b00100000, /* 22 i(слева) */
-  0b00000100, /* 23 i(справа) */
-  0b00010101, /* 24 J */
-  0b10110000, /* 25 L */
-  0b00100110, /* 26 n */
-  0b00110110, /* 27 o */
-  0b11100011, /* 28 P */
-  0b00100010, /* 29 r */
-  0b10110010, /* 30 t */
-  0b10110101, /* 31 U */
-  0b00110100, /* 32 u */
-  0b10010111, /* 33 Y */
-  0b10000001, /* 34 " */
-  0b10000000, /* 35 '(слева) */
-  0b00000001  /* 36 '(справа) */
-};
+screen_t g_screens[7];
+uint8_t g_active_screen = SENSOR1;
+uint8_t g_last_screen = SENSOR1;
+unsigned long g_active_timestamp; /* Время активности (время
+    с последнего нажатия кнопки) */
 
-/* Режимы индикатора
- *  Предделители для таймера 2:
- *  (счётчик таймера увеличивается на единицу после переполнения предделителя)
- *  001: 1 такт;
- *  010: 8 тактов;
- *  011: 32 такта;
- *  100: 64 такта;
- *  101: 128 тактов;
- *  110: 256 тактов;
- *  111: 1024 такта.
- */
-const uint8_t c_indicator_prescalers_on[] =  {0b100, 0b010, 0b010, 0b001}; /* время "горения" каждого знака */
-const uint8_t c_indicator_prescalers_off[] = {    0, 0b100, 0b110, 0b101}; /* пауза перед следующим циклом */
+OneWire g_sensors(7); /* Порт D7 на Arduino = D7 на Atmega328p */
+uint8_t g_sensors_addr[2][8]; /* Адреса датчиков */
+int g_sensors_min[2] = {9999, 9999};
+int g_sensors_max[2] = {-999, -999};
+bool g_wakeup_by_timer;
 
-/* Выбор режима индикации заметно влияет на энергопотребление. Разница между режимами 0 и 1 - в три раза.
- *  Поэтому, если не использовать экономный режим, имеет смысл использовать не самый яркий режим
- */
-uint8_t g_indicator_mode = 0;
-const uint8_t c_indicator_max_mode = sizeof(c_indicator_prescalers_on) / sizeof(*c_indicator_prescalers_on) - 1;
+unsigned long g_poll_timestamp; /* Метка времени опроса датчиков */
 
+bool g_swap_sensors = false; /* При подключении датчиков невозможно
+    задать порядок подключения. Он определяется внутренними адресами
+    датчиков. По этой причине для единообразия делаем возможной перемену
+    датчиков местами */
 
-/***************************************
+/***********************************************************************
  * Состояние кнопок
  */
-uint8_t g_buttons_hard_state = 0b1111; /* Фактическое состояние кнопок ("железа") для определения 
-  нажатий/отжатий: 0 - нажата, 1 - отжата */
-uint8_t g_buttons_ctrl_state = 0b0000; /* Состояние кнопок, используемых для комбинаций (т.н. контрольные
-  кнопки - по аналогии с кнопкой Ctrl на ПК): 1 - нажата, 0 - отжата */
-uint8_t g_pressed_button = 0; /* Номер нажатой кнопки - последней нажатой кнопки, т.е. той кнопки,
-  на которую будет реакция программы: 0 - нет нажатой кнопки, 1-4 - номер кнопки (слева направо) */
-unsigned long g_pressed_timestamp = 0; /* Штамп времени нажатия или последней обработки кнопки (для режима
-  многократных повторов) */
-bool g_pressed_timestamp_first = false; /* Первый штамп (многократные повторы начинаются не сразу) */
 
+/* Фактическое состояние кнопок ("железа") для определения
+    нажатий/отжатий: 0 - нажата, 1 - отжата */
+uint8_t g_buttons_hard_state = 0b1111;
+/* Состояние кнопок, используемых для комбинаций (т.н. контрольные
+    кнопки - по аналогии с кнопкой Ctrl на ПК): 1 - нажата, 0 - отжата */
+uint8_t g_buttons_ctrl_state = 0b0000;
+/* Номер нажатой кнопки - последней нажатой кнопки, т.е. той кнопки,
+    на которую будет реакция программы: 0 - нет нажатой кнопки,
+    1-4 - номер кнопки (слева направо) */
+uint8_t g_pressed_button = 0;
+/* Штамп времени нажатия или последней обработки кнопки (для режима
+    многократных повторов) */
+unsigned long g_pressed_timestamp = 0;
+/* Первый штамп (многократные повторы начинаются не сразу) */
+bool g_pressed_timestamp_first = false;
 
-/***********************************************************************************************************
- * Обработка прерывания от нажатия кнопок на портах D0 (PCINT16), D1 (PCINT17), D2 (PCINT18) и D3 (PCINT19)
+/***********************************************************************
+ *  Обработка прерывания от нажатия кнопок на портах D0 (PCINT16),
+ *  D1 (PCINT17), D2 (PCINT18) и D3 (PCINT19)
  */
 ISR(PCINT2_vect)
 {
-  /* Нам нужно только просыпаться. Всё остальная обработка в рабочем цикле */
+    /* Нам нужно только просыпаться. Всё остальная обработка
+        в рабочем цикле */
+    g_wakeup_by_timer = false;
 }
 
-/***********************************************************************************************************
- * Динамическая индикация
- */
-ISR(TIMER2_OVF_vect)
-{
-  /* Отключаем индикаторы (катоды к питанию) */
-  PORTC |= 0b00111100;
-
-  /* В первом, самом ярком режиме "пауза" не используется */
-  if (g_indicator_mode == 0 && g_indicator_i == 4) g_indicator_i = 0;
-
-  if (g_indicator_i == 4) {
-    /* "Пауза" - на время выключаем экран, чтобы уменьшить яркость */
-    TCCR2B = c_indicator_prescalers_off[g_indicator_mode];
-    g_indicator_i = 0;
-  }
-  else {
-    TCCR2B = c_indicator_prescalers_on[g_indicator_mode];
-    
-    /* Данные для индикации берём из глобального массива g_indicator[] */
-    PORTB = g_indicator[g_indicator_i];
-    PORTC &= ~(1 << (5 - g_indicator_i)) | 0b11000011; /* Нужный катод на землю*/
-
-    g_indicator_i++;
-  }
-}
-
-/***********************************************************************************************************
- * Очистка индикатора
- */
-void clear_indicator()
-{
-  g_indicator[0] = 0;
-  g_indicator[1] = 0;
-  g_indicator[2] = 0;
-  g_indicator[3] = 0;
-
-  PORTB = 0; /* Аноды на землю */
-  PORTC |= 0b00111100; /* Катоды к питанию */
-}
-
-/******************************************************************************
- * Вывод сразу всех значений на индикатор
- */
-void show(uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3)
-{
-  g_indicator[0] = d0;
-  g_indicator[1] = d1;
-  g_indicator[2] = d2;
-  g_indicator[3] = d3;
-}
-
-/***********************************************************************************************************
- * Задержка с проверкой нажатия кнопок
- * Работает без сложностей: разбивает заданное время на промежутки по 50мс и проверяет изменение порта
- * между паузами.
- */
-bool delay_with_test_buttons(uint16_t time, bool break_if_pressed)
-{
-  bool test = false;
-
-  while (time > 0) {
-    if ((PIND & 0b1111) != 0b1111) {
-      test = true;
-      if (break_if_pressed) break;
-    }
-    delay(50);
-    time -= 50;
-  }
-
-  return test;
-}
-
-/***********************************************************************************************************
- * Запуск температурных датчиков на конвертацию
- */
-void convertT()
-{
-  ds18b20.reset();
-  ds18b20.write(0xCC); /* SKIP ROM (обращаемся ко всем датчикам) */
-  ds18b20.write(0x44); /* CONVERT T (конверсия значения температуры и запись в scratchpad) */
-}
-
-/***********************************************************************************************************
- * Задержка на 750мс для получения данных от датчиков
+/***********************************************************************
+ *  Задержка на 750мс для получения данных от датчиков
  */
 void delay750()
 {
-  show(c_digits[11], 0, 0, 0);
-  delay(190);
-  show(0, c_digits[11], 0, 0);
-  delay(190);
-  show(0, 0, c_digits[11], 0);
-  delay(190);
-  show(0, 0, 0, c_digits[11]);
-  delay(190);
-  clear_indicator();
+    g_indicator.print(SIGN_DP, EMPTY, EMPTY, EMPTY);
+    delay(190);
+    g_indicator.print(EMPTY, SIGN_DP, EMPTY, EMPTY);
+    delay(190);
+    g_indicator.print(EMPTY, EMPTY, SIGN_DP, EMPTY);
+    delay(190);
+    g_indicator.print(EMPTY, EMPTY, EMPTY, SIGN_DP);
+    delay(190);
+    g_indicator.clear();
 }
 
-/******************************************************************************
- * Вывод числа с фиксированной запятой на индикатор
- *  value - выводимое число;
- *  decimals - кол-во знаков после запятой;
+/***********************************************************************
+ *  Запуск температурных датчиков на конвертацию
  */
-bool show_fix(int num, int decimals)
+void convertT()
 {
-  bool minus = false;
-  int pos_of_dp = 3 - decimals;
-  
-  /* Для отрицательного числа выделяем положительную часть, а минус запоминаем */
-  if (num < 0) {
-    minus = true;
-    num = -num;
-  }
-  
-  /* Выводим число поразрядно - от единиц и далее - пока число не "закончится",
-    либо пока не закончится место для числа */
-  for (int i = 3; i >= 0; i--) {
-    /* В конце выводим минус */
-    if (num == 0 && i < pos_of_dp && minus) {
-      g_indicator[i] = c_digits[10]; /* Минус */
-      minus = false;
-    }
-    /* Выводим числа поразрядно. Вместо ведущих нулей - пробелы */
-    else {
-      uint8_t n = (num > 0 || i >= pos_of_dp ? c_digits[num % 10] : 0);
-      if (decimals != 0 && i == pos_of_dp) n |= c_digits[11]; /* Точка */
-      g_indicator[i] = n;
-    }
-    num /= 10;
-  }
-
-  /* Если число не вместилось, сигнализируем об ошибке */
-  return (num != 0 || minus == true ? false : true);
+    g_sensors.reset();
+    g_sensors.write(0xCC); /* SKIP ROM (обращаемся ко всем датчикам) */
+    g_sensors.write(0x44); /* CONVERT T (конверсия значения температуры
+        и запись в scratchpad) */
 }
 
-/***********************************************************************************************************
- * Вывод температуры на индикатор
+/***********************************************************************
+ *  Чтение данных с датчика
  */
-void show_temp(uint8_t num_sensor)
+void update_temp(uint8_t sensor)
 {
-  /* Читаем значение температуры. Конвертация температуры уже должна быть к этому времени выполнена */
-  ds18b20.reset();
-  ds18b20.select( ds_address[num_sensor] );
-  ds18b20.write(0xBE); /* READ SCRATCHPAD (читаем данные) */
+    /*  Читаем значение температуры. Конвертация температуры уже должна
+        быть к этому времени выполнена */
+    g_sensors.reset();
+    g_sensors.select( g_sensors_addr[sensor]);
+    g_sensors.write(0xBE); /* READ SCRATCHPAD (читаем данные) */
 
-  uint8_t tempL = ds18b20.read(); 
-  uint8_t tempH = ds18b20.read();
+    uint8_t tempL = g_sensors.read(); /* "Нижний" байт данных */
+    uint8_t tempH = g_sensors.read(); /* "Верхний" байт данных */
 
-  /* Разбиваем полученное значение температуры на части:
-   *  minus - минус;
-   *  ti - целая часть;
-   *  td - дробная часть.
-   */
-  bool minus = false;
-  uint16_t ti = (tempH << 8) | tempL;
-  uint8_t td;
+    bool negative = false; /* Флаг отрицательного значения */
 
-  if (ti & 0x8000) {
-    ti = -ti;
-    minus = true;
-  }
-  
-  /* Переводим дробную часть (4 бита) из двоичной системы в десятичную.
-    Оставляем только один знак, округляем значение (+8) */
-  td = ((ti & 0xF) * 10 + 8) / 16;
-  /* Убираем дробную часть */
-  int temperature = (ti >> 4) * 10 + td;
-  if (minus) temperature = -temperature;
-  
-  show_fix(temperature, 1);
+    /* Получаем целую часть значения */
+    uint16_t ti = (tempH << 8) | tempL;
+    if (ti & 0x8000) {
+        ti = -ti;
+        negative = true;
+    }
+
+    /*  Переводим дробную часть (4 бита) из двоичной системы в десятичную.
+        Оставляем только один знак, округляем значение (+8) */
+    uint8_t td = ((ti & 0xF) * 10 + 8) / 16;
+
+    /* Формируем значение с фиксированной точкой */
+    int temp = (ti >> 4) * 10 + td;
+    if (negative)
+        temp = -temp;
+    
+    g_screens[sensor].print_fix( temp, 1);
+    if (temp < g_sensors_min[sensor]) {
+        g_sensors_min[sensor] = temp;
+        g_screens[sensor + SENSORS_MIN].print_fix( temp, 1);
+    }
+    
+    if (temp > g_sensors_max[sensor]) {
+        g_sensors_max[sensor] = temp;
+        g_screens[sensor + SENSORS_MAX].print_fix( temp, 1);
+    }
 }
 
-/***********************************************************************************************************
- * Запись в EEPROM
+/***********************************************************************
+ *  Запись в EEPROM
  */
 void EEPROM_write(uint16_t addr, uint8_t data)
 {
-  while (EECR & (1<<EEPE)); /* Ждём завершения предыдущей записи */
-  EEAR = addr;
-  EEDR = data;
-  EECR |= (1<<EEMPE); /* Так надо, зачем - не понял */
-  EECR |= (1<<EEPE); /* Начинаем запись */
+    while (EECR & (1<<EEPE)); /* Ждём завершения предыдущей записи */
+    
+    EEAR = addr;
+    EEDR = data;
+    EECR |= (1<<EEMPE); /* Так надо, зачем - не понял */
+    EECR |= (1<<EEPE); /* Начинаем запись */
 }
 
-/***********************************************************************************************************
- * Чтение из EEPROM
+/***********************************************************************
+ *  Чтение из EEPROM
  */
 uint8_t EEPROM_read(uint16_t addr)
 {
-  while (EECR & (1<<EEPE)); /* Ждём завершения предыдущей записи */
-  EEAR = addr;
-  EECR |= (1<<EERE);
-  return EEDR;
+    while (EECR & (1<<EEPE)); /* Ждём завершения предыдущей записи */
+    EEAR = addr;
+    EECR |= (1<<EERE);
+    return EEDR;
 }
 
-/***********************************************************************************************************
- * Функция настройки приложения 
+/***********************************************************************
+ *  Опрос состояния кнопок
+ *  p_ctrl_state  - состояние кнопок ([4]-[3]-[2]-[1], 0 - не нажата,
+ *      1 - нажата).
+ *  Возврат: номер кнопки, требующей обработки (1..4).
  */
-void setup()
+uint8_t test_buttons(uint8_t *p_ctrl_state)
 {
-  /* Важный комментарий из даташита про неиспользуемые пины (14.2.6 Unconnected Pins):
-   *  "Если некоторые пины не используются, рекомендуется убедиться, что эти выводы имеют определенный
-   *  уровень. Хотя большинство цифровых входов отключены в режимах глубокого сна, как описано выше,
-   *  плавающие входы следует избегать, чтобы уменьшить потребление тока во всех других режимах, когда
-   *  цифровые входы включены (сброс, Активный режим и режим ожидания). Самый простой способ, чтобы
-   *  гарантировать определенный уровень у неиспользуемого пина - включение внутреннего подтягивающего
-   *  резистора. В этом случае подтягивающие резисторы будут отключены во время сброса. Если важно низкое
-   *  энергопотребление в режиме сброса, рекомендуется использовать внешний подтягивающий резистор к плюсу
-   *  или к минусу. Подключение неиспользуемых выводов непосредственно к VCC или GND не рекомендуется,
-   *  поскольку это может привести к чрезмерным токам, если вывод случайно будет сконфигурирован как выход".
-   */
-  
-  /* Настраиваем порты */
-  DDRB  = 0b11111111; /* B0-B7 - аноды индикатора (output) */
-  PORTB = 0b00000000; /* Аноды индикатора на землю */
-  DDRC  = 0b00111100; /* C2-C5 - катоды индикаторы (output); C0,C1,C6 - неиспользуемые пины (input) */
-  PORTC = 0b01111111; /* Катоды индикатора к питанию, неиспользуемые пины к подтягивающим резисторам */
-  DDRD  &= 0b10000000; /* D0-D3 - кнопки (input); D7 - температурные датчики (не меняем, т.к. настраивается
-    отдельно); D4-D6 - неиспользуемые пины (input) */
-  PORTD |= 0b01111111; /* Кнопки и неиспользуемые пины к подтягивающим резисторам, D7 не меняем */
- 
-  /* Настраиваем таймер для динамической индикации */
-  TCCR2A = 0; /* Используем обычный (Normal) режим работы таймера */
-  TCCR2B = c_indicator_prescalers_on[g_indicator_mode]; /* Устанавливаем предделитель */
-  TCNT2 = 0;
-  TIMSK2 = (1 << TOIE2); /* Запускаем таймер - он будет работать всегда, кроме режима глубокого сна */
+    uint8_t signaled_button = 0;
+    uint8_t pressed_button = 0;
 
-  /* Устанавливаем прерывания на нажатия кнопок */
-  PCICR = (1 << PCIE2);
-  PCMSK2 = (1 << PCINT16) | (1 << PCINT17) | (1 << PCINT18) | (1 << PCINT19);
-
-  /* Ищем датчики DS18B20. Порядок регулировать самостоятельно */
-  ds18b20.search(ds_address[0]);
-  ds18b20.search(ds_address[1]);
-
-  g_sensors_swap = EEPROM_read(0);
-
-  g_work_timestamp = millis();
-}
-
-/***********************************************************************************************************
- * Основной цикл
- */
-void loop()
-{
-  uint8_t signaled_button = 0;
-  uint8_t ctrl_state = 0;
-  uint8_t pressed_button = 0;
-
-  /* Ищем изменения в состоянии кнопок */
-  {
     uint8_t buttons_hard_state = PIND & 0b1111;
 
     if (buttons_hard_state != g_buttons_hard_state) {
-      delay(50); /* Ждём завершения дребезга контактов. Не самое лучшее решение, но ограничимся им */
-      buttons_hard_state = PIND & 0b1111;
+        delay(50); /* Ждём завершения дребезга контактов. Не самое
+            лучшее решение, но ограничимся им */
+        buttons_hard_state = PIND & 0b1111;
     }
 
     /* Проверяем все кнопки по очереди */
     for (int i = 0; i < 4; i++) {
-      uint8_t mask = (1 << i);
+        uint8_t mask = (1 << i);
 
-      if ((buttons_hard_state & mask) != (g_buttons_hard_state & mask)) {
-        /* Была нажата кнопка */
-        if ((buttons_hard_state & mask) == 0) {
-          g_buttons_ctrl_state |= mask; /* Сохраняем в состоянии контрольных кнопок */
-          pressed_button = i + 1; /* Сохраняем номер нажатой кнопки. При одновременном нажатии
-            кнопок (вдруг!) приоритет за той, что имеет больший номер */
-        }
-        /* Была отпущена кнопка */
-        else {
-          /* Если отпущена "нажатая" кнопка, сигнализируем об этом */
-          if (i == g_pressed_button - 1) {
-            ctrl_state = g_buttons_ctrl_state & ~mask; /* Сохраняем состояние контрольных кнопок на случай,
-              если с "нажатой" кнопкой одновременно были отпущены и контрольные. Если этого не сделать, то
-              для следующих проверяемых кнопок "нажатая" кнопка уже будет отсутствовать и их состояние может
-              быть сброшено */
-            g_buttons_ctrl_state = ~buttons_hard_state & 0x0F; /* Приводим состояние контрльных кнопок
-              в соответствие с фактическим положением дел */
-            g_pressed_button = 0;
-            signaled_button = i + 1;
-          }
-          else if (g_pressed_button == 0) g_buttons_ctrl_state &= ~mask; /* Если есть "нажатая" кнопка,
-            то отпускание проверяемой кнопки НЕ приводит к исключению её из состояния контрольных кнопок.
-            Т.е. если были нажаты последовательно кнопки [1] и [2], то вне зависимости от порядка их
-            отпускания программой будет выполнена комбинация [1]+[2] (не [2] и не [2]+[1]). Если же
-            "нажатой" кнопки нет (была уже отпущена, или были одновременно нажаты несколько кнопок), то
-            кнопка спокойно из списка контрольных кнопок исключается */
-        }
-      } /* if ((buttons_hard_state & mask) != (g_buttons_hard_state & mask)) */
+        if ((buttons_hard_state & mask)
+                != (g_buttons_hard_state & mask)) {
+            /* Была нажата кнопка */
+            if ((buttons_hard_state & mask) == 0) {
+                g_buttons_ctrl_state |= mask; /* Сохраняем в состоянии
+                    контрольных кнопок */
+                pressed_button = i + 1; /* Запоминаем номер нажатой
+                    кнопки. При одновременном нажатии кнопок приоритет
+                    за той, что имеет больший номер */
+            }
+            /* Была отпущена кнопка */
+            else {
+                /*  Если отпущена "нажатая" кнопка,
+                    сигнализируем об этом */
+                if (i == g_pressed_button - 1) {
+                    /*  Сохраняем состояние контрольных кнопок на
+                        случай, если с "нажатой" кнопкой одновременно
+                        были отпущены и контрольные. Если этого не
+                        сделать, то для следующих проверяемых кнопок
+                        "нажатая" кнопка уже будет отсутствовать и их
+                        состояние может быть сброшено */
+                    *p_ctrl_state = g_buttons_ctrl_state & ~mask;
+                    /*  Приводим состояние контрльных кнопок
+                        в соответствие с фактическим положением дел */
+                    g_buttons_ctrl_state = ~buttons_hard_state & 0x0F;
+                    g_pressed_button = 0;
+                    signaled_button = i + 1;
+                }
+                /*  Если есть "нажатая" кнопка, то отпускание
+                    проверяемой кнопки НЕ приводит к исключению её из
+                    состояния контрольных кнопок. Т.е. если были нажаты
+                    последовательно кнопки [1] и [2], то вне зависимости
+                    от порядка их отпускания программой будет выполнена
+                    комбинация [1]+[2] (не [2] и не [2]+[1]). Если же
+                    "нажатой" кнопки нет (была уже отпущена, или были
+                    одновременно нажаты несколько кнопок), то кнопка
+                    спокойно из списка контрольных кнопок исключается */
+                else if (g_pressed_button == 0) g_buttons_ctrl_state &= ~mask;
+            }
+        } /* if ((buttons_hard_state & mask)
+                     != (g_buttons_hard_state & mask)) */
     } /* for (int i = 0; i < 4; i++) */
-    
-    /* Сохраняем номер "нажатой" кнопки, начинаем отсчёт времени удержания кнопки */
+  
+    /*  Сохраняем номер "нажатой" кнопки, начинаем отсчёт времени
+        удержания кнопки */
     if (pressed_button) {
-      g_pressed_button = pressed_button;
-      g_pressed_timestamp = millis();
-      g_pressed_timestamp_first = true;
+        g_pressed_button = pressed_button;
+        g_pressed_timestamp = millis();
+        g_pressed_timestamp_first = true;
     }
 
     g_buttons_hard_state = buttons_hard_state;
-  
-  } /* Ищем изменения в состоянии кнопок */
 
-  /* Иммитация многократного нажатия при удержании кнопок более 1 секунды 
-    (но только для тех сочетаний, где это имеет смысл!) */
-  if (g_pressed_button &&
-          (g_buttons_ctrl_state == 0b0001
-        || g_buttons_ctrl_state == 0b0010
-        || g_buttons_ctrl_state == 0b0100
-        || g_buttons_ctrl_state == 0b1000)) {
+    /*  Иммитация многократного нажатия при удержании кнопок более
+        1 секунды (но только для тех сочетаний, где это имеет смысл!) */
+    if (g_pressed_button &&
+            (g_buttons_ctrl_state == 0b0001
+            || g_buttons_ctrl_state == 0b0010
+            || g_buttons_ctrl_state == 0b0100
+            || g_buttons_ctrl_state == 0b1000)) {
 
-    unsigned long timestamp = millis();
-    unsigned elapsed = (unsigned)(timestamp - g_pressed_timestamp);
+        unsigned long timestamp = millis();
+        unsigned elapsed = (unsigned)(timestamp - g_pressed_timestamp);
     
-    if (g_pressed_timestamp_first && elapsed >= 1000
-        || !g_pressed_timestamp_first && elapsed >= 200) {
+        if (g_pressed_timestamp_first && elapsed >= 1000
+                || !g_pressed_timestamp_first && elapsed >= 200) {
   
-      ctrl_state = g_buttons_ctrl_state & ~(1 << (g_pressed_button - 1));
-      signaled_button = g_pressed_button;
-      g_pressed_timestamp = timestamp;
-      g_pressed_timestamp_first = false;
+            *p_ctrl_state = g_buttons_ctrl_state & ~(1 << (g_pressed_button - 1));
+            signaled_button = g_pressed_button;
+            g_pressed_timestamp = timestamp;
+            g_pressed_timestamp_first = false;
+        }
     }
-  }
 
-  /* Обработка сигнала (отпускания) кнопки.
-   *  [3] – 1-й датчик;
-   *  [4] – 2-й датчик.
-   */
-  if (signaled_button) {
-    g_work_timestamp = millis();
+    return signaled_button;
+}
+
+/***********************************************************************
+ * Обмен данными
+ */
+void swap(void *dat1, void *dat2, unsigned int len)
+{
+    for (unsigned int i = 0; i < len; i++) {
+        uint8_t sw = ((uint8_t*)dat1)[i];
+        ((uint8_t*)dat1)[i] = ((uint8_t*)dat2)[i];
+        ((uint8_t*)dat2)[i] = sw;
+    }
+}
+
+/***********************************************************************
+ * Перемена датчиков местами
+ */
+void swap_sensors()
+{
+    g_swap_sensors = !g_swap_sensors;
+    swap( g_sensors_addr[0], g_sensors_addr[1], 8);
+    EEPROM_write(EEPROM_SWAP_SENSORS, g_swap_sensors);
+}
+
+/***********************************************************************
+ * Смена режима
+ */
+void change_screen(uint8_t new_screen, anim_t anim_type)
+{
+    g_indicator.anim( g_screens[new_screen], anim_type);
+    if (g_active_screen != MESSAGE)
+        g_last_screen = g_active_screen;
+    g_active_screen = new_screen;
+}
+
+/***********************************************************************
+ * Вывод ошибки на экран
+ */
+void error(uint8_t errno)
+{
+    g_screens[MESSAGE].print_int(errno);
+    g_screens[MESSAGE].print(CHAR_E, errno < 10 ? DIG3 : DIG2);
+    change_screen( MESSAGE, ANIM_NO);
+}
+
+/***********************************************************************
+ * Функция настройки приложения 
+ */
+void setup()
+{
+    /*  Важный комментарий из даташита про неиспользуемые пины
+     *  (14.2.6 Unconnected Pins):
+     *  "Если некоторые пины не используются, рекомендуется убедиться,
+     *  что эти выводы имеют определенный уровень. Хотя большинство
+     *  цифровых входов отключены в режимах глубокого сна, как описано
+     *  выше, плавающие входы следует избегать, чтобы уменьшить
+     *  потребление тока во всех других режимах, когда цифровые входы
+     *  включены (сброс, Активный режим и режим ожидания). Самый простой
+     *  способ, чтобы гарантировать определенный уровень
+     *  у неиспользуемого пина - включение внутреннего подтягивающего
+     *  резистора. В этом случае подтягивающие резисторы будут отключены
+     *  во время сброса. Если важно низкое энергопотребление в режиме
+     *  сброса, рекомендуется использовать внешний подтягивающий
+     *  резистор к плюсу или к минусу. Подключение неиспользуемых
+     *  выводов непосредственно к VCC или GND не рекомендуется,
+     *  поскольку это может привести к чрезмерным токам, если вывод
+     *  случайно будет сконфигурирован как выход".
+     */
+
+  
+    /***
+     * Настраиваем порты
+     */
+
+    /*  Порт B (аноды индикатора) не трогаем, настраивается отдельно */
     
+    /*  Порт C:
+     *  C7 - отсутствует
+     *  C6 - не используется (input, pull-up)
+     *  C5-C2 - катоды индикаторы (не трогаем, настраивается отдельно)
+     *  C1-C0 - не используются (input, pull-up)
+     */
+    DDRC  =  (DDRC & 0b00111100) | 0b00000000;
+    PORTC = (PORTC & 0b00111100) | 0b01000011;
+
+    /*  Порт D:
+     *  D7 - температурные датчики (не трогаем, настраивается отдельно)
+     *  D6-D4 - не используются (input, pull-up)
+     *  D3-D0 - кнопки (input, pull-up)
+     */
+    DDRD  =  (DDRD & 0b10000000) | 0b00000000;
+    PORTD = (PORTD & 0b10000000) | 0b01111111;
+
+    /* Устанавливаем прерывания на нажатия кнопок */
+    PCICR = (1 << PCIE2);
+    PCMSK2 =
+        (1 << PCINT16) | (1 << PCINT17)
+        | (1 << PCINT18) | (1 << PCINT19);
+ 
+    /***
+     * Настраиваем экраны
+     */
+    
+    g_screens[SENSOR1_MIN].set_brightness(4);
+    g_screens[SENSOR2_MIN].set_brightness(4);
+    g_screens[SENSOR1_MAX].set_brightness(4);
+    g_screens[SENSOR2_MAX].set_brightness(4);
+    g_active_screen = SENSOR1;
+    
+    /***
+     * Разбираемся с датчиками
+     */
+
+    /* Ищем датчики */
+    if (!g_sensors.search( g_sensors_addr[0])
+            || !g_sensors.search( g_sensors_addr[1])) {
+        /* Нет датчика(-ов) */
+        error(1);
+    }
+
+    uint8_t swap = EEPROM_read( EEPROM_SWAP_SENSORS);
+    if (swap == 1) /* Первоначально в EEPROM записано 255 */
+        swap_sensors();
+
+    /* Ждём первых результатов от датчиков */
     convertT();
-    if (g_data_is_obsolete) {
-      delay750();
-      g_data_is_obsolete = false;
+    g_poll_timestamp = millis();
+    delay750();
+}
+
+/***********************************************************************
+ * Основной цикл
+ */
+void loop()
+{
+    /* Во время активности опрос датчиков каждые 750 мс */
+    if (millis() - g_poll_timestamp > 750) {
+        update_temp(SENSOR1);
+        update_temp(SENSOR2);
+        convertT();
+        g_poll_timestamp = millis();
+    }
+  
+    /***  
+     *  Обработка сигнала (отпускания) кнопки.
+     *  [1] - минимальная температура
+     *  [2] - максимальная температура
+     *  [3] – 1-й датчик
+     *  [4] – 2-й датчик
+     *  [1]+[2] - сброс значений min и max
+     *  [3]+[4] – настройки: перемена датчиков местами
+     */
+    uint8_t ctrl_state = 0;
+    uint8_t signaled_button = test_buttons(&ctrl_state);
+
+    if (signaled_button) {
+        g_active_timestamp = millis();
+
+        if (signaled_button == 1 && ctrl_state == 0b0010 ||
+                signaled_button == 2 && ctrl_state == 0b0001) {
+            /* [1]+[2] - сброс min-max значений */
+            g_sensors_min[0] = g_sensors_min[1] = 9999;
+            g_sensors_max[0] = g_sensors_max[1] = -999;
+            g_indicator.clear();
+            delay(500);
+        }
+        
+        else if (signaled_button == 3 && ctrl_state == 0b1000 ||
+                signaled_button == 4 && ctrl_state == 0b0100) {
+            /* [3]+[4] - меняем датчики местами  */
+            swap_sensors();
+        }
+
+        else if (ctrl_state == 0) {
+
+            switch (g_active_screen) {
+            case SENSOR1:
+                switch (signaled_button) {
+                case 1:
+                    change_screen( SENSOR1_MIN, ANIM_GODOWN);
+                    break;
+                case 2:
+                    change_screen( SENSOR1_MAX, ANIM_GOUP);
+                    break;
+                case 4:
+                    change_screen( SENSOR2, ANIM_GORIGHT);
+                    break;
+                }
+                break;
+                
+            case SENSOR2:
+                switch (signaled_button) {
+                case 1:
+                    change_screen( SENSOR2_MIN, ANIM_GODOWN);
+                    break;
+                case 2:
+                    change_screen( SENSOR2_MAX, ANIM_GOUP);
+                    break;
+                case 3:
+                    change_screen( SENSOR1, ANIM_GOLEFT);
+                    break;
+                }
+                break;
+            
+            case SENSOR1_MIN:
+                switch (signaled_button) {
+                case 2:
+                    change_screen( SENSOR1, ANIM_GOUP);
+                    break;
+                case 4:
+                    change_screen( SENSOR2_MIN, ANIM_GORIGHT);
+                    break;
+                }
+                break;
+
+            case SENSOR2_MIN:
+                switch (signaled_button) {
+                case 2:
+                    change_screen( SENSOR2, ANIM_GOUP);
+                    break;
+                case 3:
+                    change_screen( SENSOR1_MIN, ANIM_GOLEFT);
+                    break;
+                }
+                break;
+
+            case SENSOR1_MAX:
+                switch (signaled_button) {
+                case 1:
+                    change_screen( SENSOR1, ANIM_GODOWN);
+                    break;
+                case 4:
+                    change_screen( SENSOR2_MAX, ANIM_GORIGHT);
+                    break;
+                }
+                break;
+
+            case SENSOR2_MAX:
+                switch (signaled_button) {
+                case 1:
+                    change_screen( SENSOR2, ANIM_GODOWN);
+                    break;
+                case 3:
+                    change_screen( SENSOR1_MAX, ANIM_GOLEFT);
+                    break;
+                }
+                break;
+
+            case MESSAGE:
+                change_screen( g_last_screen, ANIM_NO);
+                break;
+                
+            } /* switch g_active_screen */
+
+        } /* else if (ctrl_state == 0) */
+            
+    } /* if (signaled_button) */
+
+    /* Особенности режимов */
+    if (g_active_screen == SENSOR1_MIN || g_active_screen == SENSOR2_MIN) {
+        if (millis() - g_active_timestamp > 2000)
+            change_screen( g_active_screen - SENSORS_MIN, ANIM_GOUP);
+    }
+    else if (g_active_screen == SENSOR1_MAX || g_active_screen == SENSOR2_MAX) {
+        if (millis() - g_active_timestamp > 2000)
+            change_screen( g_active_screen - SENSORS_MAX, ANIM_GODOWN);
     }
 
-    /* Любое сочетание клавиш (выбор-то не богат) приводит к перемене датчиков местами */
-    if (ctrl_state != 0) {
-      g_sensors_swap = !g_sensors_swap;
-      EEPROM_write(0, g_sensors_swap);
-    }
+    g_indicator.copy( g_screens[g_active_screen]);
 
-    /* У нас только две кнопки - [3] и [4] */
-    switch (signaled_button) {
-      case 3:
-        show_temp(g_sensors_swap ? 1 : 0);
-        break;
-  
-      case 4:
-        show_temp(g_sensors_swap ? 0 : 1);
-        break;
-    } /* switch (signaled_button) */
-  } /* if (signaled_button) */
-  
-  /* Если можно заснуть, засыпаем */
-  if (millis() - g_work_timestamp > 5000) {
-    cli(); /* Отключаем прерывания, чтобы динамическая индикация не обновила индикатор после нашей очистки -
-      иначе есть реальная вероятность, что какой-нибудь знак останется гореть */
-    clear_indicator();
-    LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
-    g_work_timestamp = millis();
-    g_data_is_obsolete = true;
-    sei();
-  }
-  else {
-    /* Засыпаем между вызовами TIMER2 для индикации ради экономии энергии. TIMER0 не отключаем,
-     *  т.к. он используется Arduino для расчёта времени. Нам он нужен для millis() */
-    LowPower.idle(SLEEP_FOREVER, ADC_OFF, TIMER2_ON, TIMER1_OFF, TIMER0_ON, SPI_OFF, USART0_OFF, TWI_OFF);
-  }
+    /* Если можно заснуть, засыпаем */
+    if (millis() - g_active_timestamp > 5000) {
+        cli(); /* Отключаем прерывания, чтобы динамическая индикация
+            не обновила индикатор после нашей очистки - иначе есть
+            реальная вероятность, что какой-нибудь знак останется
+            гореть */
+        g_indicator.clear();
+        g_wakeup_by_timer = true;
+        while (g_wakeup_by_timer) {
+            /* Периодически просыпаемся, чтобы считать данные с датчиков */
+            LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+            update_temp(SENSOR1);
+            update_temp(SENSOR2);
+            convertT();
+        }
+        g_active_timestamp = millis();
+        sei();
+    }
+    else {
+        /*  Засыпаем между вызовами TIMER2 для индикации ради экономии
+            энергии. TIMER0 не отключаем, т.к. он используется Arduino
+            для расчёта времени. Нам он нужен для millis() */
+        LowPower.idle(
+            SLEEP_FOREVER, ADC_OFF, TIMER2_ON, TIMER1_OFF, TIMER0_ON,
+            SPI_OFF, USART0_OFF, TWI_OFF);
+    }
 }
 
