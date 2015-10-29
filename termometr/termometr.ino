@@ -186,7 +186,7 @@ void swap_sensors()
  */
 void change_screen(uint8_t new_screen, anim_t anim_type)
 {
-    g_indicator.anim( g_screens[new_screen], anim_type);
+    g_indicator.delayed_anim( &g_screens[new_screen], anim_type);
     if (g_active_screen != MESSAGE)
         g_last_screen = g_active_screen;
     g_active_screen = new_screen;
@@ -264,7 +264,9 @@ void setup()
     g_screens[SENSOR2_MIN].set_brightness(7);
     g_screens[SENSOR1_MAX].set_brightness(7);
     g_screens[SENSOR2_MAX].set_brightness(7);
+    
     g_active_screen = SENSOR1;
+    g_indicator.set_copy_screen( &g_screens[g_active_screen]);
     
     /***
      * Разбираемся с датчиками
@@ -425,15 +427,16 @@ void loop()
             change_screen( g_active_screen - SENSORS_MAX, ANIM_GODOWN);
     }
 
-    g_indicator.copy( g_screens[g_active_screen]);
-
     /* Если можно заснуть, засыпаем */
     if (millis() - g_active_timestamp > 5000) {
-        cli(); /* Отключаем прерывания, чтобы динамическая индикация
-            не обновила индикатор после нашей очистки - иначе есть
-            реальная вероятность, что какой-нибудь знак останется
-            гореть */
-        g_indicator.clear();
+        
+        for (int i = 15; i >= 0; i--) {
+            g_screens[SENSOR1].set_brightness(i);
+            g_screens[SENSOR2].set_brightness(i);
+            delay(30);
+        }
+        g_indicator.stop();
+        
         g_wakeup_by_timer = true;
         while (g_wakeup_by_timer) {
             /* Периодически просыпаемся, чтобы считать данные с датчиков */
@@ -442,8 +445,12 @@ void loop()
             update_temp(SENSOR2);
             convertT();
         }
+        
+        g_screens[SENSOR1].set_brightness(15);
+        g_screens[SENSOR2].set_brightness(15);
+        g_indicator.start();
+        
         g_active_timestamp = millis();
-        sei();
     }
     else {
         /*  Засыпаем между вызовами TIMER2 для индикации ради экономии

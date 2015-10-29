@@ -64,7 +64,7 @@ struct indicator_mode_t {
     uint8_t off_count;
 };
 
-const indicator_mode_t c_indicator_modes[] = {
+static const indicator_mode_t c_indicator_modes[] = {
     {4, 1, 4, 1}, /*  0 -  0.0% */
     {1, 1, 5, 1}, /*  1 -  0.8% */
     {1, 1, 4, 1}, /*  2 -  1.5% */
@@ -83,15 +83,27 @@ const indicator_mode_t c_indicator_modes[] = {
     {3, 1, 0, 1}  /* 15 - 25.0% */
 };
 
-const uint8_t c_max_brightness =
+static const uint8_t c_max_brightness =
     sizeof(c_indicator_modes) / sizeof(*c_indicator_modes) - 1;
 
 /* Массив изображений цифр для индикатора */
-const uint8_t c_digits0_9[10] = {
+static const uint8_t c_digits0_9[10] = {
     DIGIT_0, DIGIT_1, DIGIT_2, DIGIT_3, DIGIT_4,
     DIGIT_5, DIGIT_6, DIGIT_7, DIGIT_8, DIGIT_9};
 
-indicator_t *g_one_indicator;
+static indicator_t *g_one_indicator;
+
+/***********************************************************************
+ *  Плавное мигание
+ *  Параметры:
+ *  - step - значение кратные 0..31 (0 и 31 - максимальная яркость,
+ *    15,16 - минимальная яркость)
+ */
+void screen_t::blink(uint8_t step)
+{
+    step %= 32;
+    brightness_ = (step <= 15 ? 15 - step : step - 16);
+}
 
 /***********************************************************************
  * Яркость
@@ -112,7 +124,7 @@ void screen_t::set_brightness(int8_t brightness)
  *  - num - выводимое число;
  *  - decimals - кол-во знаков после запятой;
  *  - begin, end - начальная и конечная позициия для вывода числа
- *      (от 1 до 4);
+ *    (от 1 до DIG_COUNT);
  *  - space - заполняющий символ вместо пробелов.
  */
 bool screen_t::print_fix(
@@ -154,7 +166,8 @@ bool screen_t::print_fix(
 /***********************************************************************
  *  Вспомогательная функция для анимации - "отправляем" знак вверх
  *  Для следующего шага надо заново запустить функцию, передав ей
- *  полученный результат. Всего шагов - 2. Третий шаг приведёт к пустоте.
+ *  полученный результат. Всего шагов - 2. Третий шаг приведёт
+ *  к пустоте.
  */
 uint8_t screen_t::anim_send_up(uint8_t digit)
 {
@@ -173,8 +186,10 @@ uint8_t screen_t::anim_send_up(uint8_t digit)
  *  Вспомогательная функция для анимации - "принимаем" знак снизу
  *  Параметры:
  *  - digit - знак;
- *  - step - номер шага (0 - пусто; 1,2 - промежуточные шаги;
- *    3 - сам знак).
+ *  - step - номер шага: 
+ *    - 0 - пусто;
+ *    - 1, 2 - промежуточные шаги;
+ *    - 3 - сам знак.
  */
 uint8_t screen_t::anim_take_from_bottom(uint8_t digit, uint8_t step)
 {
@@ -231,9 +246,12 @@ uint8_t screen_t::anim_send_down(uint8_t digit)
 
 /***********************************************************************
  *  Вспомогательная функция для анимации - "принимаем" знак сверху
+ *  Параметры:
  *  - digit - знак;
- *  - step - номер шага (0 - пусто; 1,2 - промежуточные шаги;
- *    3 - сам знак).
+ *  - step - номер шага: 
+ *    - 0 - пусто;
+ *    - 1, 2 - промежуточные шаги;
+ *    - 3 - сам знак.
  */
 uint8_t screen_t::anim_take_from_above(uint8_t digit, uint8_t step)
 {
@@ -270,131 +288,153 @@ uint8_t screen_t::anim_take_from_above(uint8_t digit, uint8_t step)
 }
 
 /***********************************************************************
+ *  Анимированный "уход"
+ *  Параметры:
+ *  - anim_type - вид анимации.
+ *  
+ *  Работа идёт только с текущим экраном.
+ */
+anim_state_t screen_t::anim_leave(anim_t anim_type)
+{
+    switch (anim_type) {
+    case ANIM_GOLEFT:
+        digits_[3] = digits_[2];
+        digits_[2] = digits_[1];
+        digits_[1] = digits_[0];
+        digits_[0] = 0;
+        break;
+
+    case ANIM_GORIGHT:
+        digits_[0] = digits_[1];
+        digits_[1] = digits_[2];
+        digits_[2] = digits_[3];
+        digits_[3] = 0;
+        break;
+    
+    case ANIM_GODOWN:
+        for (int i = 0; i < DIG_COUNT; i++)
+            digits_[i] = anim_send_up( digits_[i]);
+        break;
+    
+    case ANIM_GOUP:
+        for (int i = 0; i < DIG_COUNT; i++)
+            digits_[i] = anim_send_down( digits_[i]);
+        break;
+    } /* switch (anim_type) */
+
+    return is_empty() ? ANIM_LEAVE_STOP : ANIM_LEAVE;
+}
+
+/***********************************************************************
+ *  Анимированный "приход"
+ *  Параметры:
+ *  - anim_type - вид анимации;
+ *  - p_step - номер шага.
+ */
+anim_state_t screen_t::anim_come(
+    anim_t anim_type, const screen_t &new_screen, uint8_t *p_step)
+{
+    anim_state_t anim_state = ANIM_COME;
+    uint8_t step = *p_step;
+    
+    switch (anim_type) {
+    case ANIM_GOLEFT:
+        /* Пропускаем пустые символы */
+        if (step == 0)
+            for (; step < DIG_COUNT; step++)
+                if (new_screen.digits_[DIG_COUNT - 1 - step] != 0)
+                    break;
+
+        /*  Шаг 0 - появляется первый (крайний правый) символ
+            Шаг 3 - появляется последний (крайний левый) символ */
+        if (step >= 3) {
+            step = 3;
+            anim_state = ANIM_STOP;
+        }
+
+        for (int8_t i = 0; i <= step; i++)
+            digits_[i] = new_screen.digits_[DIG_COUNT - 1 - step + i];
+        break;
+
+    case ANIM_GORIGHT:
+        /* Пропускаем пустые символы */
+        if (step == 0)
+            for (; step < DIG_COUNT; step++)
+                if (new_screen.digits_[step] != 0)
+                    break;
+
+        /*  Шаг 0 - появляется первый (крайний левый) символ
+            Шаг 3 - появляется последний (крайний правый) символ */
+        if (step >= 3) {
+            step = 3;
+            anim_state = ANIM_STOP;
+        }
+
+        for (int8_t i = 0; i <= step; i++)
+            digits_[DIG_COUNT - 1 - step + i] = new_screen.digits_[i];
+        break;
+    
+    case ANIM_GODOWN:
+        /*  Шаг 0 - появляются верхние планки символов
+            Шаг 2 - появляется символ целиком */
+        if (step >= 2) {
+            step = 2;
+            anim_state = ANIM_STOP;
+        }
+
+        for (int i = 0; i < 4; i++)
+            digits_[i] = anim_take_from_bottom(
+                new_screen.digits_[i], step + 1);
+        break;
+      
+    case ANIM_GOUP:
+        /*  Шаг 0 - появляются нижние планки символов
+            Шаг 2 - появляется символ целиком */
+        if (step >= 2) {
+            step = 2;
+            anim_state = ANIM_STOP;
+        }
+
+        for (int i = 0; i < 4; i++)
+            digits_[i] = anim_take_from_above(
+                new_screen.digits_[i], step + 1);
+        break;
+    
+    default:
+        copy( new_screen);
+        anim_state = ANIM_STOP;
+
+    } /* switch (anim_type) */
+
+    *p_step = step + 1;
+    
+    return anim_state;
+}
+
+/***********************************************************************
  *  Анимация
- *  new_screen - массив новые значений индикатора;
- *  anim_type - вид анимации;
- *  step_delay - задержка между шагами анимации.
+ *  Параметры:
+ *  - new_screen - массив новые значений индикатора;
+ *  - anim_type - вид анимации;
+ *  - step_delay - задержка между шагами анимации.
  */
 void screen_t::anim(
     const screen_t &new_screen, anim_t anim_type, uint16_t step_delay)
 {
     const uint8_t *new_digits = new_screen.digits_;
     
-    switch (anim_type) {
-    case ANIM_GOLEFT: {
-        /* Уходим */
-        for (int8_t i = 0; i < 4; i++) {
-            digits_[3] = digits_[2];
-            digits_[2] = digits_[1];
-            digits_[1] = digits_[0];
-            digits_[0] = 0;
-            delay(step_delay);
-            
-            /* Как только экран очистился, переходим к следующему этапу */
-            if (digits_[0] == 0 && digits_[1] == 0 &&
-                    digits_[2] == 0 && digits_[3] == 0)
-                break;
-        }
+    /* Уходим */
+    while (anim_leave(anim_type) != ANIM_LEAVE_STOP)
+        delay(step_delay);
 
-        /* Ищем последний значимый символ в новом значении */
-        int8_t last = -1;
-        for (int i = 3; i >= 0; i--) {
-            if (new_digits[i] != 0) {
-                last = i;
-                break;
-            }
-        }
-         
-        /* Приходим */
-        set_brightness( new_screen.brightness_);
-        
-        for (int8_t i = 0; i < 4; i++) {
-            for (int8_t j = 0; j <= i; j++) {
-                int8_t index = last - i + j;
-                digits_[j] = (index < 0 ? 0 : new_digits[index]);
-            }
-            delay(step_delay);
-        }
-    } break;
+    set_brightness( new_screen.brightness_);
 
-    case ANIM_GORIGHT: {      
-        /* Уходим */
-        for (int i = 0; i < 4; i++) {
-            digits_[0] = digits_[1];
-            digits_[1] = digits_[2];
-            digits_[2] = digits_[3];
-            digits_[3] = 0;
-            delay(step_delay);
-            
-            /* Как только экран очистился, переходим к следующему этапу */
-            if (digits_[0] == 0 && digits_[1] == 0 &&
-                    digits_[2] == 0 && digits_[3] == 0)
-                break;
-        }
-
-        /* Ищем первый значимый символ в новом значении */
-        int8_t first = 4;
-        for (int i = 0; i <= 3; i++) {
-            if (new_digits[i] != 0) {
-                first = i;
-                break;
-            }
-        }
-
-        /* Приходим */
-        set_brightness( new_screen.brightness_);
-
-        for (int i = 0; i < 4 - first; i++) {
-            for (int j = 0; j <= i; j++) {
-                digits_[3 - i + j] = new_digits[first + j];
-            }
-            delay(step_delay);
-        }
-    } break;
-    
-    case ANIM_GODOWN: {
-        /* Уходим */
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 4; j++) {
-                digits_[j] = anim_send_up(digits_[j]);
-            }
-            delay(step_delay);
-        }
-        
-        /* Приходим */
-        set_brightness( new_screen.brightness_);
-
-        for (int i = 1; i <= 3; i++) {
-            for (int j = 0; j < 4; j++) {
-                digits_[j] = anim_take_from_bottom(new_digits[j], i);
-            }
-            delay(step_delay);
-        }
-    } break;
-      
-    case ANIM_GOUP: {
-        /* Уходим */
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 4; j++) {
-                digits_[j] = anim_send_down(digits_[j]);
-            }
-            delay(step_delay);
-        }
-      
-        /* Приходим */
-        set_brightness( new_screen.brightness_);
-
-        for (int i = 1; i <= 3; i++) {
-            for (int j = 0; j < 4; j++) {
-                digits_[j] = anim_take_from_above(new_digits[j], i);
-            }
-            delay(step_delay);
-        }
-    } break;
-    
-    default:
-        copy( new_screen);
-    } /* switch (anim_type) */
+    /* Приходим */
+    uint8_t anim_step = 0;
+    do {
+        delay(step_delay);
+    } while (anim_come( anim_type, new_screen, &anim_step) !=
+        ANIM_STOP);
 }
 
 /***********************************************************************
@@ -417,8 +457,8 @@ indicator_t::indicator_t()
     TCCR2B = 1; /* Устанавливаем предделитель (для первого запуска
         самый минимальный) */
     TCNT2 = 0;
-    TIMSK2 = (1 << TOIE2); /* Запускаем таймер - он будет работать
-        всегда, кроме режима глубокого сна */
+
+    start();
 }
 
 /***********************************************************************
@@ -437,16 +477,41 @@ void indicator_t::timer_processing()
 {
     if (--repeat_counter_) return;
 
-    const indicator_mode_t &mode = c_indicator_modes[brightness_];
-
     /* Отключаем индикаторы (катоды к питанию) */
     PORTC |= 0b00111100;
+
+    if (p_copy_screen_)
+        brightness_ = p_copy_screen_->get_brightness();
+
+    const indicator_mode_t &mode = c_indicator_modes[brightness_];
 
     /* В самом ярком режиме пауза не используется */
     if (digits_n_ == 4 && mode.prescaler_off == 0)
         digits_n_ = 0;
 
     if (digits_n_ < 4) {
+        
+        /* Анимация экрана */
+        if (digits_n_ == 0) {
+            if (anim_state_ != ANIM_STOP) {
+                /* Шаги анимации */
+                if (millis() - anim_timestamp_ >= step_delay_) {
+                    anim_state_ = (anim_state_ == ANIM_LEAVE ?
+                        anim_leave(anim_type_) : anim_come(
+                            anim_type_, *p_copy_screen_, &anim_step_));
+                    
+                    if (anim_state_ == ANIM_LEAVE_STOP)
+                        p_copy_screen_ = p_new_copy_screen_;
+
+                    anim_timestamp_ = millis();
+                }
+            }
+            /*  Обновляем значения экрана, если задан экран
+                для копирования */
+            else if (p_copy_screen_)
+                copy(*p_copy_screen_);
+        }
+
         /* Режим горения. Поочерёдно "зажигаем" знаки */
         TCCR2B = mode.prescaler_on;
         repeat_counter_ = mode.on_count;
